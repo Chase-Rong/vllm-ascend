@@ -334,6 +334,29 @@ class AscendConfig:
         )
         self._validate_sparse_c8_kv_offload_compatibility()
 
+        self.streaming_kv_config = StreamingKVTieringConfig(
+            self.vllm_config,
+            additional_config.get("streaming_kv_config", {}),
+        )
+        self._validate_streaming_kv_compatibility()
+
+    def _validate_streaming_kv_compatibility(self) -> None:
+        if not self.streaming_kv_config.enabled:
+            return
+        if self.sparse_kv_offload_config.enabled:
+            raise ValueError(
+                "streaming_kv_config is mutually exclusive with sparse_kv_offload_config; "
+                "both manage host-resident KV with different data paths. Enable only one."
+            )
+        scheduler_config = getattr(self, "scheduler_config", None)
+        if scheduler_config is not None and getattr(scheduler_config, "recompute_scheduler_enable", False):
+            raise ValueError(
+                "streaming_kv_config is mutually exclusive with the recompute scheduler "
+                "offload path. Enable only one."
+            )
+        if self.vllm_config.use_v2_model_runner:
+            raise ValueError("streaming_kv_config doesn't support model_runner_v2 now.")
+
     def _validate_sparse_c8_kv_offload_compatibility(self) -> None:
         if self.sparse_kv_offload_config.enabled and self.enable_sparse_sfa_c8:
             raise NotImplementedError(
@@ -990,6 +1013,55 @@ class SchedulerConfig:
                 env_key,
             )
         return default
+
+
+class StreamingKVTieringConfig:
+    """Configuration for decode-side streaming KV tiering (hybrid linear models).
+
+    See docs/hybrid_linear_kv_tiering_graph_mode_design.md.
+    """
+
+    def __init__(self, vllm_config: "VllmConfig", user_config: dict[str, Any]):
+        self.enabled = bool(user_config.get("enabled", False))
+        if not self.enabled:
+            return
+
+        # Per-rank HBM budget (bytes) available for full-attention KV,
+        # including the staging buffers. The policy streams enough layers to
+        # fit resident KV + staging within this budget.
+        self.hbm_budget_bytes = int(user_config.get("hbm_budget_bytes", 0))
+        # Per-rank CPU budget (bytes) for the host KV pool.
+        self.cpu_budget_bytes = int(user_config.get("cpu_budget_bytes", 64 * (1 << 30)))
+        # Host<->NPU bandwidth (bytes/s). 0 means "use the init-time
+        # micro-benchmark"; probe_host_bandwidth.py gives a stable value to
+        # configure explicitly for reproducible plans.
+        self.host_bandwidth_bytes_per_s = float(user_config.get("host_bandwidth_bytes_per_s", 0))
+        # Optional aggregate TPS target; the policy warns below it unless
+        # allow_low_bandwidth is set.
+        self.target_tps = user_config.get("target_tps", None)
+        if self.target_tps is not None:
+            self.target_tps = float(self.target_tps)
+        self.allow_low_bandwidth = bool(user_config.get("allow_low_bandwidth", False))
+        # Explicit streaming layer names; overrides automatic selection.
+        self.stream_layers = user_config.get("stream_layers", None)
+        if self.stream_layers is not None and not (
+            isinstance(self.stream_layers, list) and all(isinstance(n, str) for n in self.stream_layers)
+        ):
+            raise ValueError("streaming_kv_config.stream_layers must be a list of layer names")
+        # Prefetch depth: issue a streaming layer's onload this many layers
+        # ahead within the same decode step (never across steps).
+        self.prefetch_depth = int(user_config.get("prefetch_depth", 3))
+        if self.prefetch_depth <= 0:
+            raise ValueError("streaming_kv_config.prefetch_depth must be positive")
+        # Per-request maximum in-flight tokens covered by one staging slot.
+        # Defaults to max_model_len; can be lowered to cap staging HBM.
+        self.staging_max_tokens = int(
+            user_config.get("staging_max_tokens", vllm_config.model_config.max_model_len)
+        )
+        if self.hbm_budget_bytes < 0:
+            raise ValueError("streaming_kv_config.hbm_budget_bytes must be >= 0")
+        if self.cpu_budget_bytes <= 0:
+            raise ValueError("streaming_kv_config.cpu_budget_bytes must be positive")
 
 
 class SparseKVOffloadConfig:

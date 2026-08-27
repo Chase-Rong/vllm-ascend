@@ -332,3 +332,52 @@ vllm.v1.core.kv_cache_utils._get_kv_cache_config_packed = _get_kv_cache_config_d
 import vllm.v1.engine.core  # noqa: E402
 
 vllm.v1.engine.core.resolve_kv_cache_block_sizes = _ascend_resolve_kv_cache_block_sizes
+
+# ---------------------------------------------------------------------------
+# Streaming KV tiering: host-resident groups contribute zero to the HBM
+# bytes-per-block computation; the CPU budget is validated against the
+# resulting num_blocks. The wrapper delegates all layout math to the original
+# implementation (device groups only), so it is robust across vLLM versions.
+# ---------------------------------------------------------------------------
+import dataclasses  # noqa: E402
+
+from vllm_ascend.distributed.kv_transfer.streaming_kv.accounting import (  # noqa: E402
+    is_host_streaming_group,
+    validate_cpu_budget,
+)
+
+_orig_get_kv_cache_config_from_groups = vllm.v1.core.kv_cache_utils.get_kv_cache_config_from_groups
+
+
+def _ascend_get_kv_cache_config_from_groups(
+    vllm_config: VllmConfig,
+    kv_cache_groups: list[KVCacheGroupSpec],
+    available_memory: int,
+) -> KVCacheConfig:
+    if not any(is_host_streaming_group(g) for g in kv_cache_groups):
+        return _orig_get_kv_cache_config_from_groups(vllm_config, kv_cache_groups, available_memory)
+
+    device_groups = [g for g in kv_cache_groups if not is_host_streaming_group(g)]
+    host_groups = [g for g in kv_cache_groups if is_host_streaming_group(g)]
+
+    # num_blocks is derived from device groups only: host-streaming groups
+    # consume no HBM. Their block ids still come from the shared pool.
+    config = _orig_get_kv_cache_config_from_groups(vllm_config, device_groups, available_memory)
+
+    from vllm_ascend.ascend_config import get_ascend_config
+
+    streaming_cfg = get_ascend_config().streaming_kv_config
+    validate_cpu_budget(host_groups, config.num_blocks, streaming_cfg.cpu_budget_bytes)
+
+    # Reattach the host groups so the scheduler/coordinator sees the full
+    # group set; the worker allocates their storage (host pool + staging)
+    # outside the HBM kv_cache_tensors.
+    if dataclasses.is_dataclass(config):
+        return dataclasses.replace(config, kv_cache_groups=kv_cache_groups)
+    config.kv_cache_groups = kv_cache_groups
+    return config
+
+
+vllm.v1.core.kv_cache_utils.get_kv_cache_config_from_groups = _ascend_get_kv_cache_config_from_groups
+if hasattr(vllm.v1.engine.core, "get_kv_cache_config_from_groups"):
+    vllm.v1.engine.core.get_kv_cache_config_from_groups = _ascend_get_kv_cache_config_from_groups

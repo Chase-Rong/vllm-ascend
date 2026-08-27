@@ -17,6 +17,7 @@
 # Adapted from vllm-project/vllm/vllm/worker/gpu_model_runner.py
 #
 
+import dataclasses
 import logging
 import math
 import sys
@@ -140,6 +141,9 @@ from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.sparse_kv_offload_man
     init_sparse_kv_offload_manager,
     reshape_kv_cache_tensors_for_sparse_kv_offload,
     update_sparse_kv_offload_metadata,
+)
+from vllm_ascend.distributed.kv_transfer.streaming_kv.manager import (  # noqa: E402
+    init_streaming_kv_manager,
 )
 from vllm_ascend.distributed.utils import get_decode_context_model_parallel_world_size
 from vllm_ascend.eplb.adaptor.vllm_adaptor import VllmEplbAdaptor
@@ -592,6 +596,13 @@ class NPUModelRunner(GPUModelRunner):
         self.sparse_kv_offload_config = self.ascend_config.sparse_kv_offload_config
         self.sparse_kv_offload_enabled = self.sparse_kv_offload_config.enabled
         self.sparse_kv_offload_manager = None
+
+        self.streaming_kv_config = self.ascend_config.streaming_kv_config
+        self.streaming_kv_enabled = self.streaming_kv_config.enabled
+        # Residency plan computed in get_kv_cache_spec(); consumed by the
+        # streaming KV manager during kv cache registration.
+        self.streaming_kv_plan = None
+        self.streaming_kv_manager = None
         self.tp_rank = get_tensor_model_parallel_rank() if model_parallel_is_initialized() else 0
 
         # Per-request metadata consumed by the Sparse KV offload resident LRU.
@@ -3764,6 +3775,16 @@ class NPUModelRunner(GPUModelRunner):
                 kv_cache_config,
                 self.sparse_kv_offload_config,
             )
+        if self.streaming_kv_enabled:
+            assert self.streaming_kv_plan is not None and self.streaming_kv_plan.stream_layers
+            self.streaming_kv_manager = init_streaming_kv_manager(
+                self.vllm_config,
+                kv_cache_config,
+                self.streaming_kv_plan,
+                self.streaming_kv_config,
+                max_num_reqs=self.max_num_reqs,
+            )
+            self._wrap_streaming_decoder_layers()
         kv_caches = self.initialize_kv_cache_tensors(kv_cache_config)
         # TODO: refactor the logic of attention
         if (
@@ -3805,6 +3826,24 @@ class NPUModelRunner(GPUModelRunner):
 
         if self.model_config.enable_return_routed_experts:
             self.init_routed_experts_capturer()
+
+    def _wrap_streaming_decoder_layers(self) -> None:
+        """Wrap decoder layer forwards with streaming onload/writeback hooks."""
+        from vllm_ascend.distributed.kv_transfer.streaming_kv.hooks import (
+            wrap_decoder_layers_for_streaming,
+        )
+
+        assert self.streaming_kv_manager is not None
+        wrapped = wrap_decoder_layers_for_streaming(
+            self.model,
+            self.streaming_kv_manager,
+            prefetch_depth=self.streaming_kv_config.prefetch_depth,
+        )
+        if wrapped == 0:
+            raise RuntimeError(
+                "streaming-kv: no decoder layers matched for wrapping; "
+                "check that the model's decoder layers expose layer_idx."
+            )
 
     def _bind_routed_experts_capturer(self, capturer=None) -> None:
         # test_qwen3_moe_routing_replay
@@ -4153,6 +4192,12 @@ class NPUModelRunner(GPUModelRunner):
                             k_tensor_split_factor, v_tensor_split_factor = calc_split_factor(kv_head_dim_list)
                         k_tensor_size = int(kv_cache_tensor.size // k_tensor_split_factor)
                         v_tensor_size = int(kv_cache_tensor.size // v_tensor_split_factor)
+                    if self.streaming_kv_enabled and getattr(current_kv_cache_spec, "store_on_host", False):
+                        # Streaming tier: no persistent HBM cache. Attention
+                        # consumes the manager's rotating staging buffer; a
+                        # placeholder keeps the layer registered in kv_caches.
+                        kv_cache_raw_tensors[layer_name] = (self._allocate_int8_cache_tensor(alignment, alignment),)
+                        continue
                     if self.sparse_kv_offload_enabled:
                         assert self.use_sparse, "Sparse KV offload only support sparse attention."
                         assert not current_sparse_sfa_c8, "Sparse KV offload do not support sparse SFA C8."
@@ -4362,6 +4407,10 @@ class NPUModelRunner(GPUModelRunner):
                     current_sparse_sfa_c8 = self.use_sparse and kv_cache_spec_uses_sparse_sfa_c8(
                         current_kv_cache_spec
                     )
+                    if self.streaming_kv_enabled and getattr(current_kv_cache_spec, "store_on_host", False):
+                        # Keep the placeholder as-is; no HBM reshape needed.
+                        kv_caches[layer_name] = kv_cache_raw_tensors[layer_name]
+                        continue
                     if self.sparse_kv_offload_enabled:
                         assert self.use_sparse, "Sparse KV offload only support sparse attention."
                         assert not current_sparse_sfa_c8, "Sparse KV offload do not support sparse SFA C8."
@@ -4916,7 +4965,89 @@ class NPUModelRunner(GPUModelRunner):
 
         if self.sparse_kv_offload_enabled:
             self.kv_cache_spec = kv_cache_spec # reserve for Sparse KV offload usage
+        if self.streaming_kv_enabled:
+            kv_cache_spec = self._apply_streaming_kv_residency(kv_cache_spec)
         return kv_cache_spec
+
+    def _apply_streaming_kv_residency(
+        self,
+        kv_cache_spec: dict[str, KVCacheSpec],
+    ) -> dict[str, KVCacheSpec]:
+        """Mark policy-selected full-attention layers with store_on_host=True.
+
+        Runs once at spec creation; the differing spec makes the marked layers
+        land in a separate KV cache group (merge() requires uniform
+        store_on_host), producing the resident + streaming group pair. The
+        plan is identical on every worker (same inputs).
+        """
+        from vllm_ascend.distributed.kv_transfer.streaming_kv.gating import (
+            is_hybrid_linear_spec_dict,
+        )
+        from vllm_ascend.distributed.kv_transfer.streaming_kv.policy import (
+            FullAttentionLayerInfo,
+            compute_residency_plan,
+        )
+
+        if not is_hybrid_linear_spec_dict(kv_cache_spec):
+            raise ValueError(
+                "streaming_kv_config requires a hybrid linear-attention model "
+                "(MambaSpec + full-attention layers in the KV cache spec)."
+            )
+
+        cfg = self.streaming_kv_config
+        full_attn_infos = [
+            FullAttentionLayerInfo(
+                layer_name=name,
+                page_size_bytes=spec.page_size_bytes,
+                block_size=spec.block_size,
+            )
+            for name, spec in kv_cache_spec.items()
+            if isinstance(spec, AscendMLAAttentionSpec)
+        ]
+        if not full_attn_infos:
+            raise ValueError(
+                "streaming_kv_config phase-1 requires AscendMLAAttentionSpec full-attention layers."
+            )
+
+        if cfg.hbm_budget_bytes <= 0 and cfg.stream_layers is None:
+            raise ValueError(
+                "streaming_kv_config requires either hbm_budget_bytes (automatic plan) "
+                "or an explicit stream_layers list."
+            )
+        host_bw = cfg.host_bandwidth_bytes_per_s
+        if host_bw <= 0:
+            from vllm_ascend.distributed.kv_transfer.streaming_kv.bandwidth import (
+                measure_host_bandwidth,
+            )
+            host_bw = measure_host_bandwidth()
+            logger.info("streaming-kv: measured host bandwidth %.1f GB/s", host_bw / 1e9)
+
+        plan = compute_residency_plan(
+            full_attn_infos,
+            max_model_len=self.model_config.max_model_len,
+            max_batch_size=self.max_num_reqs,
+            hbm_budget_bytes=cfg.hbm_budget_bytes,
+            host_bandwidth_bytes_per_s=host_bw,
+            target_tps=cfg.target_tps,
+            stream_layers_override=cfg.stream_layers,
+        )
+        if plan.warnings and not cfg.allow_low_bandwidth and any("TPS ceiling" in w for w in plan.warnings):
+            raise ValueError(
+                "streaming_kv_config: host bandwidth insufficient for target TPS "
+                f"({[w for w in plan.warnings if 'TPS ceiling' in w]}). "
+                "Adjust the plan or set allow_low_bandwidth=true."
+            )
+        self.streaming_kv_plan = plan
+
+        stream_set = set(plan.stream_layers)
+        return {
+            name: (
+                dataclasses.replace(spec, store_on_host=True)
+                if name in stream_set and isinstance(spec, AscendMLAAttentionSpec)
+                else spec
+            )
+            for name, spec in kv_cache_spec.items()
+        }
 
     def _check_and_update_cudagraph_mode(
         self,
