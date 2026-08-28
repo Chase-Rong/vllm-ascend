@@ -54,6 +54,11 @@ from vllm.v1.request import RequestStatus
 from vllm_ascend.ascend_config import get_ascend_config, init_ascend_config
 from vllm_ascend.distributed.kv_transfer.utils.mooncake_transfer_engine import global_te
 from vllm_ascend.distributed.kv_transfer.utils.utils import get_transfer_timeout_value
+from vllm_ascend.kv_offload.mooncake_swap_memory import (
+    get_swapped_tensor,
+    is_swapped_range,
+    iter_tensors,
+)
 from vllm_ascend.utils import enable_custom_op, is_vl_model
 
 # isort: off
@@ -406,6 +411,9 @@ class KVCacheRecvingThread(threading.Thread):
         self.mamba_ssm_size = mamba_ssm_size
         self.remote_te_port: dict[str, dict[int, int]] = SizedDict()
         self.remote_metadata_lock = threading.Lock()
+        self._swap_staging_storage: torch.Tensor | None = None
+        self._swap_staging_tensor: torch.Tensor | None = None
+        self._swap_staging_bytes = 0
 
         self.request_queue: queue.Queue[Any] = queue.Queue()
         first_kv_cache = next(iter(self.kv_caches.values()))
@@ -462,6 +470,110 @@ class KVCacheRecvingThread(threading.Thread):
                 self.num_kv_heads = max(self.model_config.hf_text_config.num_key_value_heads // self.tp_size, 1)
         self.proc_not_transfer_request: dict[str, bool] = {}
         self.proc_not_transfer_request_lock = threading.Lock()
+
+    def _swap_staging_chunk_bytes(self) -> int:
+        """Use a full aligned block-sized staging slot for each transfer."""
+        block_bytes = [int(length) for length in self.block_len_per_addr if int(length) > 0]
+        alignment = 2 * 1024 * 1024
+        chunk_bytes = max(max(block_bytes, default=alignment), alignment)
+        return (chunk_bytes + alignment - 1) // alignment * alignment
+
+    def _ensure_swap_staging(self, transfer_count: int) -> torch.Tensor:
+        chunk_bytes = self._swap_staging_chunk_bytes()
+        alignment = 2 * 1024 * 1024
+        # Each slot may start at an arbitrary remote byte offset. Reserve a
+        # full alignment window in addition to the chunk so that
+        # ``slot * slot_bytes + remote_offset`` is always in bounds.
+        slot_bytes = chunk_bytes + alignment
+        required_bytes = slot_bytes * max(1, transfer_count)
+        if self._swap_staging_tensor is not None and self._swap_staging_bytes >= required_bytes:
+            return self._swap_staging_tensor
+
+        first_cache = next(iter(self.kv_caches.values()))
+        first_tensor = next(iter_tensors(first_cache), None)
+        if first_tensor is None or first_tensor.device.type == "cpu":
+            raise RuntimeError("Mooncake swapped-memory receive requires an NPU staging tensor.")
+        storage = torch.empty(required_bytes + alignment, dtype=torch.int8, device=first_tensor.device)
+        offset = (-int(storage.data_ptr())) % alignment
+        staging = storage[offset : offset + required_bytes]
+        if int(staging.data_ptr()) % alignment != 0:
+            raise RuntimeError("Mooncake NPU staging tensor is not 2MB aligned.")
+        global_te.register_buffer([int(staging.data_ptr())], [required_bytes])
+        self._swap_staging_storage = storage
+        self._swap_staging_tensor = staging
+        self._swap_staging_bytes = required_bytes
+        return staging
+
+    def _copy_staging_to_swapped(self, dst: int, length: int, staging: torch.Tensor, staging_offset: int) -> None:
+        resolved = get_swapped_tensor(dst, length)
+        if resolved is None:
+            raise RuntimeError(f"Missing swapped tensor for Mooncake destination ptr={dst}, length={length}.")
+        target, target_offset = resolved
+        target_bytes = target.view(torch.int8).reshape(-1)
+        target_bytes.narrow(0, target_offset, length).copy_(
+            staging.narrow(0, staging_offset, length), non_blocking=False
+        )
+        torch.npu.synchronize()
+
+    def _batch_transfer_sync_read_with_swap_staging(
+        self,
+        session_id: str,
+        local_dst_list: list[int],
+        remote_src_list: list[int],
+        length_list: list[int],
+    ) -> int:
+        """Read directly for NPU destinations and stage reads for swapped ones."""
+        direct_local: list[int] = []
+        direct_remote: list[int] = []
+        direct_lengths: list[int] = []
+        staged: list[tuple[int, int, int]] = []
+        chunk_bytes = self._swap_staging_chunk_bytes()
+        alignment = 2 * 1024 * 1024
+
+        for local_dst, remote_src, length in zip(local_dst_list, remote_src_list, length_list):
+            if not is_swapped_range(local_dst, length):
+                direct_local.append(local_dst)
+                direct_remote.append(remote_src)
+                direct_lengths.append(length)
+                continue
+            remaining = int(length)
+            offset = 0
+            while remaining:
+                remote_offset = (int(remote_src) + offset) % alignment
+                piece_len = min(remaining, chunk_bytes - remote_offset)
+                staged.append((int(local_dst) + offset, int(remote_src) + offset, piece_len))
+                offset += piece_len
+                remaining -= piece_len
+
+        if direct_local:
+            ret = self.engine.batch_transfer_sync_read(session_id, direct_local, direct_remote, direct_lengths)
+            if ret < 0:
+                return ret
+        if not staged:
+            return 0
+
+        staging = self._ensure_swap_staging(min(len(staged), 16))
+        staging_ptr = int(staging.data_ptr())
+        slot_bytes = chunk_bytes + alignment
+        window = max(1, min(16, len(staging) // slot_bytes))
+        for batch_start in range(0, len(staged), window):
+            batch = staged[batch_start : batch_start + window]
+            local_staging: list[int] = []
+            remote_src: list[int] = []
+            lengths: list[int] = []
+            copies: list[tuple[int, int, int]] = []
+            for slot, (local_dst, remote, length) in enumerate(batch):
+                staging_offset = slot * slot_bytes + remote % alignment
+                local_staging.append(staging_ptr + staging_offset)
+                remote_src.append(remote)
+                lengths.append(length)
+                copies.append((local_dst, length, staging_offset))
+            ret = self.engine.batch_transfer_sync_read(session_id, local_staging, remote_src, lengths)
+            if ret < 0:
+                return ret
+            for local_dst, length, staging_offset in copies:
+                self._copy_staging_to_swapped(local_dst, length, staging, staging_offset)
+        return 0
 
     def add_request(
         self,
@@ -696,7 +808,7 @@ class KVCacheRecvingThread(threading.Thread):
                     dst_list.append(dst)
                     length_list.append(length)
 
-        ret = self.engine.batch_transfer_sync_read(session_id, src_list, dst_list, length_list)
+        ret = self._batch_transfer_sync_read_with_swap_staging(session_id, src_list, dst_list, length_list)
         if ret < 0:
             logger.error(
                 "Mooncake transfer failed for request. remote_request_id=%s, ret=%d. ",
@@ -796,7 +908,7 @@ class KVCacheRecvingThread(threading.Thread):
                 dst_list.append(dst)
                 length_list.append(length)
 
-        ret = self.engine.batch_transfer_sync_read(session_id, src_list, dst_list, length_list)
+        ret = self._batch_transfer_sync_read_with_swap_staging(session_id, src_list, dst_list, length_list)
         if ret < 0:
             logger.error(
                 "Mooncake transfer failed for request. remote_request_id=%s, ret=%d. ",
@@ -1618,6 +1730,18 @@ class MooncakeConnectorWorker:
         self.addr_group_idx: list[int] = []
         ptrs = []
         lengths = []
+
+        def add_registration(ptr: int, length: int) -> None:
+            # Swap-backed tensors are the final Decode destination. AscendDirect
+            # must not register/write those ranges; the receive thread stages
+            # into a registered NPU buffer and copies into swap memory instead.
+            # A hybrid cache view can begin in the middle of the raw allocation
+            # (for example after a padding prefix), so test the start address
+            # independently of the requested registration span.
+            if get_swapped_tensor(ptr, 1) is None:
+                ptrs.append(ptr)
+                lengths.append(length)
+
         if not self.use_hybrid:
             for layer_name, kv_cache_tuple in kv_caches.items():
                 if isinstance(kv_cache_tuple, (list, tuple)) is False:
@@ -1630,8 +1754,10 @@ class MooncakeConnectorWorker:
                         single_kv_cache.element_size() * math.prod(block_shape) * block_size_scale
                     )
                     self.kv_caches_base_addr.append(single_kv_cache.data_ptr())
-                    ptrs.append(single_kv_cache.data_ptr())
-                    lengths.append(single_kv_cache.element_size() * math.prod(single_kv_cache.shape))
+                    add_registration(
+                        single_kv_cache.data_ptr(),
+                        single_kv_cache.element_size() * math.prod(single_kv_cache.shape),
+                    )
         elif self.use_mamba:
             for kv_cache_tensor in self.kv_cache_config.kv_cache_tensors:
                 share_tensor_addr = []
@@ -1651,8 +1777,7 @@ class MooncakeConnectorWorker:
                         self.kv_caches_base_addr.append(single_kv_cache.data_ptr())
                         share_tensor_addr.append(single_kv_cache.data_ptr())
                 if share_tensor_addr:
-                    ptrs.append(min(share_tensor_addr))
-                    lengths.append(kv_cache_tensor.size)
+                    add_registration(min(share_tensor_addr), kv_cache_tensor.size)
             self.block_stride_per_addr.extend(self.block_len_per_addr)
         elif self.use_compress:
             layer_group_idx = dict[str, int]()
@@ -1681,8 +1806,7 @@ class MooncakeConnectorWorker:
                 self.addr_group_idx.append(cur_tensor_group_idx)  # type: ignore[arg-type]
                 self.block_stride_per_addr.append(share_tensor_stride[0])
                 self.block_len_per_addr.append(share_tensor_stride[0])
-                ptrs.append(min(share_tensor_addr))
-                lengths.append(kv_cache_tensor.size)
+                add_registration(min(share_tensor_addr), kv_cache_tensor.size)
         else:
             raise TypeError("Mooncake connector does not support this type kv_cache now.")
 
