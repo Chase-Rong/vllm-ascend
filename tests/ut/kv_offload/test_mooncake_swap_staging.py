@@ -11,22 +11,35 @@ The tests are split so that they can run on a host without an Ascend NPU:
   can only be judged against real swap memory.
 """
 
+import sys
+import threading
+import types
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from unittest import mock
 
 import torch
 
+from vllm_ascend.distributed.kv_transfer.kv_p2p import (
+    mooncake_hybrid_connector as connector_module,
+)
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_hybrid_connector import (
+    SWAP_STAGING_ALIGNMENT,
+    SWAP_STAGING_WINDOW,
     KVCacheRecvingThread,
+    KVCacheTaskTracker,
+    MooncakeConnector,
+    MooncakeConnectorWorker,
 )
 from vllm_ascend.kv_offload.mooncake_swap_memory import (
     clear_swapped_tensors_for_testing,
+    empty_swapped_memory,
     get_swapped_tensor,
     is_swapped_range,
     register_swapped_tensor,
 )
 
-ALIGN = 2 * 1024 * 1024
+ALIGN = SWAP_STAGING_ALIGNMENT
 
 
 def _npu_swap_available() -> bool:
@@ -64,21 +77,26 @@ class StagingThreadStub:
     _swap_staging_chunk_bytes = KVCacheRecvingThread._swap_staging_chunk_bytes
     _ensure_swap_staging = KVCacheRecvingThread._ensure_swap_staging
     _copy_staging_to_swapped = KVCacheRecvingThread._copy_staging_to_swapped
-    _batch_transfer_sync_read_with_swap_staging = (
-        KVCacheRecvingThread._batch_transfer_sync_read_with_swap_staging
-    )
+    _batch_transfer_sync_read_with_swap_staging = KVCacheRecvingThread._batch_transfer_sync_read_with_swap_staging
 
-    def __init__(self, block_len_per_addr, engine, staging_numel):
+    def __init__(self, block_len_per_addr, engine, staging_numel=None):
         self.block_len_per_addr = list(block_len_per_addr)
         self.engine = engine
+        self._swap_staging_pools: dict[threading.Thread, tuple[torch.Tensor, torch.Tensor]] = {}
+        self._swap_staging_pool_lock = threading.Lock()
         # A CPU tensor stands in for the registered NPU staging buffer; the
         # planner only needs data_ptr arithmetic and a byte-addressable view.
-        self._staging_backing = torch.zeros(staging_numel, dtype=torch.int8)
-        self._swap_staging_storage = self._staging_backing
-        self._swap_staging_tensor = self._staging_backing
-        self._swap_staging_bytes = staging_numel
+        self._staging_backing = torch.zeros(staging_numel or 1, dtype=torch.int8)
+        if staging_numel is not None:
+            self._swap_staging_pools[threading.current_thread()] = (
+                self._staging_backing,
+                self._staging_backing,
+            )
         self.kv_caches = {"layer0": self._staging_backing}
         self.copies: list[tuple[int, int, int]] = []
+
+    def current_staging(self):
+        return self._swap_staging_pools[threading.current_thread()][1]
 
     def record_copy(self, dst, length, staging, staging_offset):
         self.copies.append((dst, length, staging_offset))
@@ -149,9 +167,7 @@ class TestSwapStagingPlanner(unittest.TestCase):
         stub = self._make(engine)
         plain = torch.zeros(self.block_len, dtype=torch.int8)
 
-        ret = stub._batch_transfer_sync_read_with_swap_staging(
-            "s1", [plain.data_ptr()], [0x7000], [self.block_len]
-        )
+        ret = stub._batch_transfer_sync_read_with_swap_staging("s1", [plain.data_ptr()], [0x7000], [self.block_len])
 
         self.assertEqual(ret, 0)
         self.assertEqual(len(engine.calls), 1)
@@ -164,11 +180,9 @@ class TestSwapStagingPlanner(unittest.TestCase):
         engine = FakeEngine()
         stub = self._make(engine)
         swap = self._register_swap_dst()
-        staging_ptr = stub._swap_staging_tensor.data_ptr()
+        staging_ptr = stub.current_staging().data_ptr()
 
-        with mock.patch.object(
-            StagingThreadStub, "_copy_staging_to_swapped", StagingThreadStub.record_copy
-        ):
+        with mock.patch.object(StagingThreadStub, "_copy_staging_to_swapped", StagingThreadStub.record_copy):
             ret = stub._batch_transfer_sync_read_with_swap_staging(
                 "s1", [swap.data_ptr()], [ALIGN * 3], [self.block_len]
             )
@@ -190,9 +204,7 @@ class TestSwapStagingPlanner(unittest.TestCase):
         swap = self._register_swap_dst()
         plain = torch.zeros(self.block_len, dtype=torch.int8)
 
-        with mock.patch.object(
-            StagingThreadStub, "_copy_staging_to_swapped", StagingThreadStub.record_copy
-        ):
+        with mock.patch.object(StagingThreadStub, "_copy_staging_to_swapped", StagingThreadStub.record_copy):
             ret = stub._batch_transfer_sync_read_with_swap_staging(
                 "s1",
                 [plain.data_ptr(), swap.data_ptr()],
@@ -203,7 +215,7 @@ class TestSwapStagingPlanner(unittest.TestCase):
         self.assertEqual(ret, 0)
         self.assertEqual(len(engine.calls), 2)
         self.assertEqual(engine.calls[0][1], [plain.data_ptr()])
-        self.assertEqual(engine.calls[1][1], [stub._swap_staging_tensor.data_ptr()])
+        self.assertEqual(engine.calls[1][1], [stub.current_staging().data_ptr()])
         self.assertEqual(len(stub.copies), 1)
 
     def test_misaligned_remote_source_split_preserves_total_length(self):
@@ -214,12 +226,8 @@ class TestSwapStagingPlanner(unittest.TestCase):
         length = ALIGN + 8192
         remote_base = ALIGN * 5 + 4096  # deliberately not 2 MiB aligned
 
-        with mock.patch.object(
-            StagingThreadStub, "_copy_staging_to_swapped", StagingThreadStub.record_copy
-        ):
-            ret = stub._batch_transfer_sync_read_with_swap_staging(
-                "s1", [swap.data_ptr()], [remote_base], [length]
-            )
+        with mock.patch.object(StagingThreadStub, "_copy_staging_to_swapped", StagingThreadStub.record_copy):
+            ret = stub._batch_transfer_sync_read_with_swap_staging("s1", [swap.data_ptr()], [remote_base], [length])
 
         self.assertEqual(ret, 0)
         staged_lengths = [n for call in engine.calls for n in call[3]]
@@ -248,16 +256,14 @@ class TestSwapStagingPlanner(unittest.TestCase):
         swap = self._register_swap_dst(numel=ALIGN * 4)
         chunk = stub._swap_staging_chunk_bytes()
 
-        with mock.patch.object(
-            StagingThreadStub, "_copy_staging_to_swapped", StagingThreadStub.record_copy
-        ):
+        with mock.patch.object(StagingThreadStub, "_copy_staging_to_swapped", StagingThreadStub.record_copy):
             stub._batch_transfer_sync_read_with_swap_staging(
                 "s1", [swap.data_ptr()], [ALIGN * 7 + 1024], [ALIGN * 2 + 512]
             )
 
         for call in engine.calls:
             for local, piece in zip(call[1], call[3]):
-                slot_offset = local - stub._swap_staging_tensor.data_ptr()
+                slot_offset = local - stub.current_staging().data_ptr()
                 self.assertLessEqual(
                     slot_offset % (chunk + ALIGN) + piece,
                     chunk + ALIGN,
@@ -269,12 +275,8 @@ class TestSwapStagingPlanner(unittest.TestCase):
         stub = self._make(engine)
         swap = self._register_swap_dst()
 
-        with mock.patch.object(
-            StagingThreadStub, "_copy_staging_to_swapped", StagingThreadStub.record_copy
-        ):
-            ret = stub._batch_transfer_sync_read_with_swap_staging(
-                "s1", [swap.data_ptr()], [ALIGN], [self.block_len]
-            )
+        with mock.patch.object(StagingThreadStub, "_copy_staging_to_swapped", StagingThreadStub.record_copy):
+            ret = stub._batch_transfer_sync_read_with_swap_staging("s1", [swap.data_ptr()], [ALIGN], [self.block_len])
 
         self.assertEqual(ret, -1)
         self.assertEqual(stub.copies, [], "no copy may run after a failed transfer")
@@ -285,9 +287,7 @@ class TestSwapStagingPlanner(unittest.TestCase):
         swap = self._register_swap_dst()
         plain = torch.zeros(self.block_len, dtype=torch.int8)
 
-        with mock.patch.object(
-            StagingThreadStub, "_copy_staging_to_swapped", StagingThreadStub.record_copy
-        ):
+        with mock.patch.object(StagingThreadStub, "_copy_staging_to_swapped", StagingThreadStub.record_copy):
             ret = stub._batch_transfer_sync_read_with_swap_staging(
                 "s1",
                 [plain.data_ptr(), swap.data_ptr()],
@@ -345,6 +345,219 @@ class TestSwapStagingPlanner(unittest.TestCase):
         self.assertEqual(pending, 0)
 
 
+class TestSwapStagingPools(unittest.TestCase):
+    def setUp(self):
+        clear_swapped_tensors_for_testing()
+        self.addCleanup(clear_swapped_tensors_for_testing)
+
+    @staticmethod
+    def _fake_allocations():
+        real_empty = torch.empty
+        allocations: list[int] = []
+        allocations_lock = threading.Lock()
+
+        def allocate_on_cpu(numel, *, dtype, device):
+            del device
+            with allocations_lock:
+                allocations.append(numel)
+            return real_empty(numel, dtype=dtype, device="cpu")
+
+        fake_npu_tensor = mock.Mock(device=types.SimpleNamespace(type="npu"))
+        return allocations, allocate_on_cpu, fake_npu_tensor
+
+    def test_same_worker_allocates_and_registers_full_pool_once(self):
+        stub = StagingThreadStub([4096], FakeEngine())
+        allocations, allocate_on_cpu, fake_npu_tensor = self._fake_allocations()
+        expected_bytes = (4096 + 1) * SWAP_STAGING_WINDOW
+
+        with (
+            mock.patch.object(connector_module, "SWAP_STAGING_ALIGNMENT", 1),
+            mock.patch.object(
+                connector_module,
+                "iter_tensors",
+                side_effect=lambda _: iter([fake_npu_tensor]),
+            ),
+            mock.patch.object(
+                connector_module.torch,
+                "empty",
+                side_effect=allocate_on_cpu,
+            ),
+            mock.patch.object(connector_module.global_te, "register_buffer") as register,
+        ):
+            first = stub._ensure_swap_staging()
+            second = stub._ensure_swap_staging()
+
+        self.assertIs(first, second)
+        self.assertEqual(first.numel(), expected_bytes)
+        self.assertEqual(allocations, [expected_bytes + 1])
+        register.assert_called_once_with([first.data_ptr()], [expected_bytes])
+        self.assertEqual(len(stub._swap_staging_pools), 1)
+
+    def test_concurrent_workers_use_distinct_pools_without_overwrite(self):
+        class ConcurrentEngine:
+            def __init__(self):
+                self.owner = None
+                self.barrier = threading.Barrier(2)
+                self.staging_ptrs: dict[str, int] = {}
+                self.lock = threading.Lock()
+
+            def batch_transfer_sync_read(self, session_id, local_dst, remote_src, lengths):
+                del remote_src
+                with self.lock:
+                    self.staging_ptrs[session_id] = local_dst[0]
+                # Both workers must own a pool before either staged copy runs.
+                self.barrier.wait(timeout=5)
+                assert self.owner is not None
+                with self.owner._swap_staging_pool_lock:
+                    pools = list(self.owner._swap_staging_pools.values())
+                for _, staging in pools:
+                    start = staging.data_ptr()
+                    offset = local_dst[0] - start
+                    if offset >= 0 and offset + lengths[0] <= staging.numel():
+                        staging.narrow(0, offset, lengths[0]).fill_({"worker-1": 11, "worker-2": 22}[session_id])
+                        break
+                else:
+                    raise AssertionError("staging pointer did not resolve to a worker pool")
+                self.barrier.wait(timeout=5)
+                return 0
+
+        engine = ConcurrentEngine()
+        stub = StagingThreadStub([4096], engine)
+        engine.owner = stub
+        first_dst = torch.zeros(4096, dtype=torch.int8)
+        second_dst = torch.zeros(4096, dtype=torch.int8)
+        register_swapped_tensor(first_dst)
+        register_swapped_tensor(second_dst)
+        allocations, allocate_on_cpu, fake_npu_tensor = self._fake_allocations()
+
+        def copy_without_npu_sync(self_, dst, length, staging, staging_offset):
+            resolved = get_swapped_tensor(dst, length)
+            assert resolved is not None
+            target, target_offset = resolved
+            target.view(torch.int8).reshape(-1).narrow(0, target_offset, length).copy_(
+                staging.narrow(0, staging_offset, length)
+            )
+
+        def transfer(session_id, destination):
+            return stub._batch_transfer_sync_read_with_swap_staging(
+                session_id,
+                [destination.data_ptr()],
+                [ALIGN * 3],
+                [destination.numel()],
+            )
+
+        with (
+            mock.patch.object(connector_module, "SWAP_STAGING_ALIGNMENT", 1),
+            mock.patch.object(
+                connector_module,
+                "iter_tensors",
+                side_effect=lambda _: iter([fake_npu_tensor]),
+            ),
+            mock.patch.object(
+                connector_module.torch,
+                "empty",
+                side_effect=allocate_on_cpu,
+            ),
+            mock.patch.object(connector_module.global_te, "register_buffer") as register,
+            mock.patch.object(
+                StagingThreadStub,
+                "_copy_staging_to_swapped",
+                copy_without_npu_sync,
+            ),
+            ThreadPoolExecutor(max_workers=2) as executor,
+        ):
+            futures = [
+                executor.submit(transfer, "worker-1", first_dst),
+                executor.submit(transfer, "worker-2", second_dst),
+            ]
+            self.assertEqual([future.result(timeout=10) for future in futures], [0, 0])
+
+        self.assertEqual(len(stub._swap_staging_pools), 2)
+        self.assertNotEqual(engine.staging_ptrs["worker-1"], engine.staging_ptrs["worker-2"])
+        self.assertTrue(torch.equal(first_dst, torch.full_like(first_dst, 11)))
+        self.assertTrue(torch.equal(second_dst, torch.full_like(second_dst, 22)))
+        expected_allocation = (4096 + 1) * SWAP_STAGING_WINDOW + 1
+        self.assertEqual(allocations, [expected_allocation, expected_allocation])
+        self.assertEqual(register.call_count, 2)
+
+
+class FailureThreadStub:
+    _handle_request = KVCacheRecvingThread._handle_request
+    get_and_clear_invalid_block_ids = KVCacheRecvingThread.get_and_clear_invalid_block_ids
+    _is_failed_recv_request = KVCacheRecvingThread._is_failed_recv_request
+    _mark_failed_recv_request = KVCacheRecvingThread._mark_failed_recv_request
+    _clear_failed_recv_request = KVCacheRecvingThread._clear_failed_recv_request
+
+    def __init__(self, task_done_results):
+        self.failed_recv_requests: set[str] = set()
+        self.invalid_block_ids: set[int] = set()
+        self.failed_recv_requests_lock = threading.Lock()
+        self.use_hybrid = False
+        self._transfer_kv_cache = mock.Mock(side_effect=RuntimeError("transfer failed"))
+        self._transfer_kv_cache_all_groups = mock.Mock()
+        self._mark_request_task_done = mock.Mock(side_effect=task_done_results)
+        self._send_done_signal_to_free_remote_port = mock.Mock()
+        self._send_done_recv_signal = mock.Mock()
+        self.task_tracker = KVCacheTaskTracker()
+        self.proc_not_transfer_request: dict[str, bool] = {}
+        self.proc_not_transfer_request_lock = threading.Lock()
+        self.request_queue = mock.Mock()
+
+
+def _recv_task(local_block_ids, *, all_task_done):
+    return {
+        "request_id": "request-1",
+        "remote_request_id": "remote-1",
+        "remote_host": "127.0.0.1",
+        "remote_handshake_port": 1234,
+        "remote_port_send_num": {},
+        "local_block_ids": local_block_ids,
+        "all_task_done": all_task_done,
+    }
+
+
+class TestMooncakeLoadFailureReporting(unittest.TestCase):
+    def test_failed_blocks_are_returned_and_cleared_through_connector_api(self):
+        recv_thread = FailureThreadStub([True])
+        recv_thread.task_tracker.add_req_to_process("request-1")
+        recv_thread._handle_request(_recv_task(((3, 7), (11,)), all_task_done=True))
+
+        worker = MooncakeConnectorWorker.__new__(MooncakeConnectorWorker)
+        worker.kv_role = "kv_consumer"
+        worker.kv_recv_thread = recv_thread
+        connector = MooncakeConnector.__new__(MooncakeConnector)
+        connector.connector_worker = worker
+
+        self.assertEqual(connector.get_block_ids_with_load_errors(), {3, 7, 11})
+        self.assertEqual(connector.get_block_ids_with_load_errors(), set())
+        self.assertEqual(recv_thread.get_and_clear_finished_requests(), {"request-1"})
+
+    def test_later_task_skips_transfer_after_request_failure(self):
+        recv_thread = FailureThreadStub([False, True])
+        recv_thread.task_tracker.add_req_to_process("request-1")
+
+        recv_thread._handle_request(_recv_task(((1, 2), (3,)), all_task_done=False))
+        recv_thread._handle_request(_recv_task(((4,), (5, 6)), all_task_done=True))
+
+        recv_thread._transfer_kv_cache.assert_called_once()
+        self.assertEqual(recv_thread.get_and_clear_invalid_block_ids(), {1, 2, 3, 4, 5, 6})
+        self.assertEqual(recv_thread.get_and_clear_finished_requests(), {"request-1"})
+
+
+class TestSwappedMemoryAllocation(unittest.TestCase):
+    def test_allocator_result_is_explicitly_zeroed(self):
+        allocated = torch.full((32,), 9, dtype=torch.int8)
+        allocator = mock.Mock(return_value=allocated)
+        fake_torch_npu = types.SimpleNamespace(empty_with_swapped_memory=allocator)
+
+        with mock.patch.dict(sys.modules, {"torch_npu": fake_torch_npu}):
+            result = empty_swapped_memory((32,), dtype=torch.int8)
+
+        self.assertIs(result, allocated)
+        self.assertTrue(torch.equal(result, torch.zeros_like(result)))
+        allocator.assert_called_once_with((32,), dtype=torch.int8, device="npu")
+
+
 class TestGlobalTERegistration(unittest.TestCase):
     """Incremental (ptr, size, location) registration in GlobalTE."""
 
@@ -366,9 +579,7 @@ class TestGlobalTERegistration(unittest.TestCase):
         te, engine = self._make_te()
         te.register_buffer([0x1000, 0x2000], [64, 128])
 
-        engine.register_memory.assert_has_calls(
-            [mock.call(0x1000, 64), mock.call(0x2000, 128)], any_order=False
-        )
+        engine.register_memory.assert_has_calls([mock.call(0x1000, 64), mock.call(0x2000, 128)], any_order=False)
         self.assertEqual(engine.register_memory.call_count, 2)
 
     def test_duplicate_registration_is_skipped(self):
@@ -601,9 +812,7 @@ class TestSwapStagingOnNPU(unittest.TestCase):
         dst_offset = ALIGN + 4096
 
         stub = object.__new__(KVCacheRecvingThread)
-        KVCacheRecvingThread._copy_staging_to_swapped(
-            stub, view.data_ptr() + dst_offset, length, staging, 0
-        )
+        KVCacheRecvingThread._copy_staging_to_swapped(stub, view.data_ptr() + dst_offset, length, staging, 0)
 
         got = _readout(view, dst_offset, length)
         self.assertTrue(torch.equal(got, pattern))

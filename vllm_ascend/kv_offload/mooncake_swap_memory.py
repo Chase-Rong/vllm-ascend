@@ -9,10 +9,10 @@ into the swapped allocation after each transfer.
 
 from __future__ import annotations
 
-from typing import Any, Iterator
+from collections.abc import Iterator
+from typing import Any
 
 import torch
-
 
 _SWAPPED_TENSORS: list[tuple[int, int, torch.Tensor]] = []
 
@@ -56,16 +56,17 @@ def clear_swapped_tensors_for_testing() -> None:
 
 
 def empty_swapped_memory(shape: tuple[int, ...], *, dtype: torch.dtype) -> torch.Tensor:
-    """Allocate an NPU tensor whose storage is host-side swap memory."""
+    """Allocate zero-initialized NPU tensor storage in host-side swap memory."""
     try:
         import torch_npu
     except ImportError as exc:
-        raise RuntimeError(
-            "Mooncake swap-memory receive requires torch_npu.empty_with_swapped_memory."
-        ) from exc
+        raise RuntimeError("Mooncake swap-memory receive requires torch_npu.empty_with_swapped_memory.") from exc
 
     allocator = getattr(torch_npu, "empty_with_swapped_memory", None)
     if allocator is None:
         raise RuntimeError("Mooncake swap-memory receive requires torch_npu.empty_with_swapped_memory.")
-    return allocator(shape, dtype=dtype, device="npu")
-
+    tensor = allocator(shape, dtype=dtype, device="npu")
+    # The replaced KV-cache path used torch.zeros. Do not depend on the
+    # version-specific observation that swapped memory starts zeroed.
+    tensor.zero_()
+    return tensor
