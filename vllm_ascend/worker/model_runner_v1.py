@@ -146,6 +146,10 @@ from vllm_ascend.eplb.adaptor.vllm_adaptor import VllmEplbAdaptor
 from vllm_ascend.eplb.core.eplb_device_transfer_loader import D2DExpertWeightLoader
 from vllm_ascend.eplb.core.eplb_worker import EplbProcess
 from vllm_ascend.eplb.eplb_updator import EplbUpdator
+from vllm_ascend.kv_offload.mooncake_swap_memory import (
+    empty_swapped_memory,
+    register_swapped_tensor,
+)
 from vllm_ascend.model_executor.offloader import create_offloader
 from vllm_ascend.ops.rotary_embedding import set_cos_and_sin, update_cos_sin
 from vllm_ascend.ops.triton.spec_decode.ngram import triton_ngram_spec_decode
@@ -3939,6 +3943,50 @@ class NPUModelRunner(GPUModelRunner):
         )
         return self._align_memory(raw_tensor, alignment)[:numel]
 
+    def _use_kimi_k3_pd_swap_memory(self) -> bool:
+        """Whether K3 decode must receive Mooncake KV into swap memory.
+
+        ``KimiK3TextConfig`` keeps the ``kimi_linear`` model type, so the
+        outer multimodal config is the reliable K3 discriminator.  Restrict
+        this allocation to the Decode side of the hybrid connector; Prefill
+        and other connectors retain the normal device allocation path.
+        """
+        kv_transfer_config = self.vllm_config.kv_transfer_config
+        if kv_transfer_config is None:
+            return False
+        if str(getattr(kv_transfer_config, "kv_role", "")) != "kv_consumer":
+            return False
+        connector_names = [str(getattr(kv_transfer_config, "kv_connector", ""))]
+        extra_config = getattr(kv_transfer_config, "kv_connector_extra_config", None) or {}
+        nested_connectors = extra_config.get("connectors", [])
+        if isinstance(nested_connectors, dict):
+            nested_connectors = nested_connectors.values()
+        for nested in nested_connectors:
+            if isinstance(nested, dict):
+                nested_name = nested.get("kv_connector", "")
+            else:
+                nested_name = getattr(nested, "kv_connector", "")
+            connector_names.append(str(nested_name))
+        if not any(name.lower() == "mooncakehybridconnector" for name in connector_names):
+            return False
+        hf_config = getattr(self.model_config, "hf_config", None)
+        return str(getattr(hf_config, "model_type", "")) == "kimi_k3"
+
+    def _allocate_kimi_k3_swap_tensor(self, numel: int, alignment: int) -> torch.Tensor:
+        """Allocate an aligned int8 raw tensor backed by swap memory."""
+        if numel <= 0:
+            raise ValueError(f"Invalid cache tensor size: {numel}")
+        # Allocate extra bytes so the logical view can satisfy Mooncake's
+        # 2-MiB address requirement, just like the regular device path.
+        storage = empty_swapped_memory((numel + alignment,), dtype=torch.int8)
+        tensor = self._align_memory(storage, alignment)[:numel]
+        if int(tensor.data_ptr()) % alignment != 0:
+            raise RuntimeError(
+                "Kimi K3 Mooncake swap-memory tensor is not aligned to 2 MiB."
+            )
+        register_swapped_tensor(tensor)
+        return tensor
+
     def _allocate_sparse_c8_indexer_tensors(
         self,
         dsa_k_tensor_size: int,
@@ -4014,6 +4062,13 @@ class NPUModelRunner(GPUModelRunner):
         kv_cache_raw_tensors: dict[str, torch.Tensor | tuple[torch.Tensor, ...]] = {}
         # prefill disaggregation need the addr of cache tensor be aligned with 2M
         alignment = 2 * 1024 * 1024
+        use_kimi_k3_swap_memory = self._use_kimi_k3_pd_swap_memory()
+
+        def allocate_raw_tensor(numel: int) -> torch.Tensor:
+            if use_kimi_k3_swap_memory:
+                return self._allocate_kimi_k3_swap_tensor(numel, alignment)
+            return self._allocate_int8_cache_tensor(numel, alignment)
+
         layer_kv_cache_spec = self._get_layer_kv_cache_specs(kv_cache_config)
         # If some tensors are shared by linear layers and attention layers,
         # the same tensor format must be maintained even if some layers
@@ -4048,22 +4103,12 @@ class NPUModelRunner(GPUModelRunner):
                         is_hidden_state_cache_spec(layer_kv_cache_spec.get(ln))
                         for ln in kv_cache_tensor.shared_by
                     )
-                    if self.vllm_config.kv_transfer_config is None:
-                        tensor = torch.zeros(kv_cache_tensor.size, dtype=torch.int8, device=self.device)
-                    else:
-                        cache_size_aligned = kv_cache_tensor.size + alignment
-                        tensor = torch.zeros(cache_size_aligned, dtype=torch.int8, device=self.device)
-                        tensor = self._align_memory(tensor, alignment)[: kv_cache_tensor.size]
+                    tensor = allocate_raw_tensor(kv_cache_tensor.size)
 
                     if has_mamba and has_hidden:
                         # Allocate separate tensor for HiddenStateCacheSpec layers
                         # so ssm_state writes don't corrupt hidden-states data
-                        if self.vllm_config.kv_transfer_config is None:
-                            tensor_hs = torch.zeros(kv_cache_tensor.size, dtype=torch.int8, device=self.device)
-                        else:
-                            cache_size_aligned = kv_cache_tensor.size + alignment
-                            tensor_hs = torch.zeros(cache_size_aligned, dtype=torch.int8, device=self.device)
-                            tensor_hs = self._align_memory(tensor_hs, alignment)[: kv_cache_tensor.size]
+                        tensor_hs = allocate_raw_tensor(kv_cache_tensor.size)
                         for layer_name_inner in kv_cache_tensor.shared_by:
                             if is_hidden_state_cache_spec(layer_kv_cache_spec.get(layer_name_inner)):
                                 kv_cache_raw_tensors[layer_name_inner] = tensor_hs
@@ -4074,14 +4119,7 @@ class NPUModelRunner(GPUModelRunner):
                             kv_cache_raw_tensors[layer_name_inner] = tensor
 
                 elif "attn" in layer_name and self.use_compress and layer_name not in kv_cache_raw_tensors:
-                    if self.vllm_config.kv_transfer_config is None:
-                        tensor = torch.zeros(kv_cache_tensor.size,
-                                                dtype=torch.int8,
-                                                device=self.device)
-                    else:
-                        cache_size_aligned = kv_cache_tensor.size + alignment
-                        tensor = torch.zeros(cache_size_aligned, dtype=torch.int8, device=self.device)
-                        tensor = self._align_memory(tensor, alignment)[: kv_cache_tensor.size]
+                    tensor = allocate_raw_tensor(kv_cache_tensor.size)
                     for layer_name_inner in kv_cache_tensor.shared_by:
                         # shared the kvcache between the self_attn specs in the same group
                         kv_cache_raw_tensors[layer_name_inner] = tensor
@@ -4117,9 +4155,8 @@ class NPUModelRunner(GPUModelRunner):
                         )
                         raw_cache = (k_tensor, scale_tensor)
                     else:
-                        k_tensor = self._allocate_int8_cache_tensor(
+                        k_tensor = allocate_raw_tensor(
                             k_tensor_size,
-                            alignment,
                         )
                         raw_cache = (k_tensor,)
 
@@ -4174,14 +4211,12 @@ class NPUModelRunner(GPUModelRunner):
                     # are allocated as int8 raw bytes first and then viewed as
                     # the target dtype in _reshape_kv_cache_tensors.
                     v_tensor = None
-                    k_tensor = self._allocate_int8_cache_tensor(
+                    k_tensor = allocate_raw_tensor(
                         k_tensor_size,
-                        alignment,
                     )
                     if v_tensor_size is not None:
-                        v_tensor = self._allocate_int8_cache_tensor(
+                        v_tensor = allocate_raw_tensor(
                             v_tensor_size,
-                            alignment,
                         )
 
                     for layer_name_inner in kv_cache_tensor.shared_by:

@@ -21,6 +21,12 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_hybrid_connector import
     KVCacheRecvingThread,
     MooncakeConnectorScheduler,
 )
+from vllm_ascend.kv_offload.mooncake_swap_memory import (  # noqa: E402
+    clear_swapped_tensors_for_testing,
+    get_swapped_tensor,
+    is_swapped_range,
+    register_swapped_tensor,
+)
 
 
 class MockRequest:
@@ -137,6 +143,19 @@ class TestHybridKVCacheRecvingThreadDispatch(unittest.TestCase):
         for events in handled_worker_events:
             self.assertEqual(events[0], ("set_device", expected_device.index))
             self.assertEqual(events[1][0], "handle")
+
+    def test_swap_memory_registry_resolves_transfer_subrange(self):
+        clear_swapped_tensors_for_testing()
+        try:
+            tensor = torch.empty((128,), dtype=torch.int8)
+            register_swapped_tensor(tensor)
+            self.assertTrue(is_swapped_range(tensor.data_ptr() + 16, 32))
+            resolved = get_swapped_tensor(tensor.data_ptr() + 16, 32)
+            self.assertIsNotNone(resolved)
+            self.assertIs(resolved[0], tensor)
+            self.assertEqual(resolved[1], 16)
+        finally:
+            clear_swapped_tensors_for_testing()
 
     def test_submit_request_serializes_same_peer_fifo(self):
         thread = self._make_thread()
